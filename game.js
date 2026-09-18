@@ -63,15 +63,19 @@ const SPEEDS = [0, 85, 55, 32];   // velocidad base por tamaño
 const POINTS = [0, 100, 50, 20];  // puntos por tamaño
 
 class Asteroid {
-  constructor(x, y, size = 3) {
+  constructor(x, y, size = 3, fugaz = false) {
     this.x    = x;
     this.y    = y;
     this.size = size;
     this.radius = RADII[size];
     this.dead = false;
 
+    this.fugaz = fugaz;
+    this.ttlMax = fugaz ? rand(8, 12) : 0;
+    this.ttl = this.ttlMax;
+
     const angle = rand(0, Math.PI * 2);
-    const speed = SPEEDS[size] + rand(-15, 15);
+    const speed = (SPEEDS[size] + rand(-15, 15)) * (fugaz ? 2.2 : 1);
     this.vx = Math.cos(angle) * speed;
     this.vy = Math.sin(angle) * speed;
     this.rotSpeed = rand(-1.2, 1.2);
@@ -88,9 +92,19 @@ class Asteroid {
   }
 
   update(dt) {
+    if (this.dead) return;
     this.x   = wrap(this.x + this.vx * dt, W);
     this.y   = wrap(this.y + this.vy * dt, H);
     this.rot += this.rotSpeed * dt;
+
+    // La estrella fugaz se desintegra al agotar su tiempo
+    if (this.fugaz) {
+      this.ttl -= dt;
+      if (this.ttl <= 0) {
+        this.dead = true;
+        explode(this.x, this.y, 6);
+      }
+    }
   }
 
   split() {
@@ -102,10 +116,29 @@ class Asteroid {
   }
 
   draw() {
+    if (this.fugaz) {
+      // Parpadeo cuando la fugaz está por desintegrarse
+      if (this.ttl / this.ttlMax < 0.2 && Math.floor(this.ttl * 8) % 2 === 0) return;
+
+      // Cola de cometa sobre la velocidad
+      const sp = Math.hypot(this.vx, this.vy) || 1;
+      const ux = this.vx / sp;
+      const uy = this.vy / sp;
+      for (let i = 1; i <= 6; i++) {
+        const f = i / 6;
+        ctx.strokeStyle = `rgba(255, 170, 60, ${((1 - f) * 0.7).toFixed(2)})`;
+        ctx.lineWidth = 2.4 - f * 1.4;
+        ctx.beginPath();
+        ctx.moveTo(this.x - ux * this.radius * f, this.y - uy * this.radius * f);
+        ctx.lineTo(this.x - ux * (this.radius + 40 * f), this.y - uy * (this.radius + 40 * f));
+        ctx.stroke();
+      }
+    }
+
     ctx.save();
     ctx.translate(this.x, this.y);
     ctx.rotate(this.rot);
-    ctx.strokeStyle = '#fff';
+    ctx.strokeStyle = this.fugaz ? 'rgba(255, 170, 60, 0.95)' : '#fff';
     ctx.lineWidth   = 1.5;
     ctx.lineJoin    = 'round';
     ctx.beginPath();
@@ -293,7 +326,10 @@ function spawnAsteroids(count) {
       x = rand(0, W);
       y = rand(0, H);
     } while (Math.hypot(x - W / 2, y - H / 2) < SAFE_DIST);
-    asteroids.push(new Asteroid(x, y, 3));
+    // ~35% de que un asteroide del oleaje sea una estrella fugaz (mediana)
+    asteroids.push(Math.random() < 0.35
+      ? new Asteroid(x, y, 2, true)
+      : new Asteroid(x, y, 3));
   }
 }
 
