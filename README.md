@@ -29,6 +29,7 @@ Luego visita `http://localhost:3000`.
 | `←` `→`   | Rotar nave |
 | `↑`       | Propulsar  |
 | `Espacio` | Disparar   |
+| `Shift`   | Activar escudo (mantener) |
 
 ## Puntuación
 
@@ -44,4 +45,6 @@ Luego visita `http://localhost:3000`.
 - Asteroides se parten en fragmentos más pequeños al ser destruidos
 - Partículas de explosión al destruir asteroides
 - Power-up **Velocidad**: al destruir asteroides puede caer (12%); al recogerlo, la nave se mueve al doble de velocidad durante 5 segundos.
+- Power-up **Triple**: cae igual que el de velocidad (~12%); al recogerlo, la nave dispara 3 balas paralelas en línea recta durante 5 segundos.
+- **Escudo**: al mantener `Shift` la nave despliega un escudo energético que la vuelve inmune y destruye (partiendo sin puntos) todo asteroide que lo toque. Tiene energía limitada que se drena en uso y se recarga en reposo (barra en el HUD).
 - **Estrella fugaz**: asteroide mediano naranja (~35% por oleaje) que se mueve el doble de rápido que uno normal, con cola de cometa; se desintegra sola a los 8-12 segundos y, al ser destruido, se parte en pequeños normales.
