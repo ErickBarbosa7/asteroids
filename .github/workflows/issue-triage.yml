@@ -1,0 +1,442 @@
+name: triage de issues
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Número del issue a re-triar'
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: triage-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+env:
+  TRIAGE_MODEL: ${{ vars.TRIAGE_MODEL || 'opencode-go/deepseek-v4-flash' }}
+  AREA_OWNERS: ${{ vars.AREA_OWNERS || '{}' }}
+  DEFAULT_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  triage:
+    # Los issues de bots solo agregan ruido (dependabot, etc).
+    if: github.event_name != 'issues' || github.event.issue.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Instalar opencode
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Resolver issue
+        id: issue
+        uses: actions/github-script@v7
+        env:
+          REQUESTED: ${{ inputs.issue_number }}
+        with:
+          script: |
+            const n = context.payload.issue?.number ?? Number(process.env.REQUESTED);
+            if (!Number.isInteger(n) || n <= 0) {
+              core.setFailed(`Número de issue inválido: ${process.env.REQUESTED || 'vacío'}`);
+              return;
+            }
+            const { data } = await github.rest.issues.get({ ...context.repo, issue_number: n });
+            core.setOutput('number', data.number);
+            core.setOutput('title', data.title);
+            core.setOutput('body', data.body ?? '');
+
+      - name: Clasificar con opencode
+        id: classify
+        continue-on-error: true
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_DISABLE_AUTOUPDATE: '1'
+          # Van por env y no interpolados en el script: el body del issue es
+          # input de usuario y no debe poder inyectar shell.
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+          ISSUE_AUTHOR: ${{ steps.issue.outputs.author }}
+        run: |
+          {
+            echo "Clasificá este issue del repo de Asteroids (un clon en game.js)."
+            echo
+            echo "TÍTULO:"
+            echo "$ISSUE_TITLE"
+            echo
+            echo "AUTOR: @$ISSUE_AUTHOR"
+            echo
+            echo "CUERPO:"
+            echo "$ISSUE_BODY"
+          } > /tmp/prompt.txt
+
+          set -o pipefail
+          opencode run --agent triage --model "$TRIAGE_MODEL" \
+            "$(cat /tmp/prompt.txt)" 2>&1 | tee /tmp/triage.txt || true
+
+      - name: Aplicar triaje
+        if: always() && steps.issue.outputs.number != ''
+        uses: actions/github-script@v7
+        env:
+          TRIAGE_FILE: /tmp/triage.txt
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            // ── Taxonomía: única fuente de verdad de los labels ────────────────
+            const TIPOS = [
+              ['bug',           'd73a4a', 'Algo no funciona'],
+              ['enhancement',   'a2eeef', 'Nueva función o pedido'],
+              ['documentation', '0075ca', 'Mejora de documentación'],
+              ['question',      'd876e3', 'Se pide más información'],
+              ['refactor',      'c5def5', 'Reordena código sin cambiar el comportamiento'],
+            ];
+            const AREAS = [
+              ['nave',       'area:nave',       '1d76db', 'Nave, skins y menú de selección'],
+              ['asteroides', 'area:asteroides', '5319e7', 'Asteroides, oleajes y estrella fugaz'],
+              ['balas',      'area:balas',      'b60205', 'Balas y colisiones'],
+              ['powerups',   'area:powerups',   '0052cc', 'Power-ups de velocidad y triple'],
+              ['hud',        'area:hud',        '0e8a16', 'Marcador, vidas y nivel'],
+              ['particulas', 'area:particulas', 'fbca04', 'Partículas de explosión'],
+              ['controles',  'area:controles',  'd4c5f9', 'Teclado e input'],
+              ['loop',       'area:loop',       'f9d0c4', 'Loop principal y update'],
+              ['ui',         'area:ui',         'c2e0c6', 'HTML, CSS y canvas'],
+              ['docs',       'area:docs',       'ededed', 'README y AGENTS.md'],
+            ];
+            const PRIOS = [
+              ['alta',  'prio:alta',  'b60205', 'Bloquea el juego'],
+              ['media', 'prio:media', 'fbca04', 'Afecta el juego pero se puede seguir'],
+              ['baja',  'prio:baja',  '0e8a16', 'Cosmético'],
+            ];
+            const TAMS = [
+              ['S', 'tam:S', 'c2e0c6', 'Un ajuste puntual'],
+              ['M', 'tam:M', 'fbca04', 'Una clase o función'],
+              ['L', 'tam:L', 'd93f0b', 'Varias clases o un sistema nuevo'],
+            ];
+            const EXTRAS = [
+              ['needs-triage',   'd93f0b', 'La clasificación automática falló, revisar a mano'],
+              ['necesita-repro', 'd4c5f9', 'Faltan pasos para reproducir'],
+              ['good first issue', '7057ff', 'Bueno para empezar'],
+            ];
+
+            // Lista plana {name, color, desc} de todos los labels que este
+            // flujo administra. Cualquier label fuera de acá no se toca nunca.
+            const MANAGED = [
+              ...TIPOS.map(([k, c, d]) => ({ name: k, color: c, desc: d })),
+              ...AREAS.map(([, l, c, d]) => ({ name: l, color: c, desc: d })),
+              ...PRIOS.map(([, l, c, d]) => ({ name: l, color: c, desc: d })),
+              ...TAMS.map(([, l, c, d]) => ({ name: l, color: c, desc: d })),
+              ...EXTRAS.map(([n, c, d]) => ({ name: n, color: c, desc: d })),
+            ];
+            const MANAGED_NAMES = new Set(MANAGED.map((m) => m.name));
+
+            const TIPO_KEYS   = new Set(TIPOS.map((t) => t[0]));
+            const AREA_BY_KEY = new Map(AREAS.map(([k, l, , d]) => [k, { label: l, desc: d }]));
+            const AREA_SHOW = {
+              nave: 'Nave', asteroides: 'Asteroides', balas: 'Balas', powerups: 'Power-ups',
+              hud: 'HUD', particulas: 'Partículas', controles: 'Controles', loop: 'Loop',
+              ui: 'UI', docs: 'Docs',
+            };
+            const PRIO_KEYS = new Set(PRIOS.map((p) => p[0]));
+            const TAM_KEYS  = new Set(TAMS.map((t) => t[0]));
+
+            // ── Utilidades ────────────────────────────────────────────────────
+            const plain = (t) => String(t ?? '')
+              .toLowerCase()
+              .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+              .replace(/[^a-z0-9]+/g, ' ')
+              .trim();
+
+            const KEY_STOP = new Set([
+              'para', 'con', 'que', 'los', 'las', 'del', 'por', 'uno', 'una',
+              'este', 'esta', 'esto', 'como', 'cuando', 'donde', 'muy', 'mas',
+              'todo', 'todos', 'tiene', 'hace', 'puede', 'poder', 'deberia',
+              'the', 'and', 'with', 'this', 'that', 'from', 'pero', 'solo',
+            ]);
+            const keywords = (t) => new Set(
+              plain(t).split(' ').filter((w) => w.length >= 4 && !KEY_STOP.has(w)),
+            );
+            const limpiar = (v, max) => String(v ?? '')
+              .replace(/[|`*_]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, max);
+
+            // ── 1. Clasificación del modelo ───────────────────────────────────
+            function parseClasificacion(raw) {
+              const txt = String(raw ?? '').replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+              let json = null;
+              const sent = txt.match(/<<<JSON>>>([\s\S]*?)<<<END>>>/);
+              if (sent) json = sent[1];
+              if (!json) {
+                const a = txt.indexOf('{');
+                const b = txt.lastIndexOf('}');
+                if (a !== -1 && b > a) json = txt.slice(a, b + 1);
+              }
+              if (!json) return null;
+              try {
+                const o = JSON.parse(json.trim());
+                return o && typeof o === 'object' && !Array.isArray(o) ? o : null;
+              } catch {
+                return null;
+              }
+            }
+
+            const raw = fs.existsSync(process.env.TRIAGE_FILE)
+              ? fs.readFileSync(process.env.TRIAGE_FILE, 'utf8')
+              : '';
+            const c = parseClasificacion(raw);
+            const ok = c !== null;
+            const val = (k) => (c && c[k] !== undefined && c[k] !== null ? c[k] : null);
+
+            const tipo  = TIPO_KEYS.has(val('tipo'))     ? val('tipo')     : 'question';
+            const area  = AREA_BY_KEY.has(val('area'))    ? val('area')     : 'ui';
+            const prio  = PRIO_KEYS.has(val('prioridad')) ? val('prioridad') : 'media';
+            const tam   = TAM_KEYS.has(val('tamano'))    ? val('tamano')    : 'M';
+            const faltaRepro   = val('falta_repro')   !== false;
+            const primerIssue  = val('primer_issue') === true;
+            const resumen = limpiar(val('resumen'), 120);
+            const modulo  = limpiar(val('modulo'), 40) || 'otro';
+
+            // ── 2. Issue ──────────────────────────────────────────────────────
+            const n = Number(process.env.ISSUE_NUMBER);
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: n });
+
+            // ── 3. Título: solo se actualiza si el formato cambia algo ───────
+            const PREFIJOS = 'bug|bugfix|error|fix|feature|feat|idea|mejora|ayuda|help|todo';
+            const normalizarTitulo = (rawTitle) => {
+              let t = String(rawTitle ?? '').replace(/\s+/g, ' ').trim();
+              t = t.replace(new RegExp(`^[([]\\s*(?:${PREFIJOS})\\s*[)\\]]\\s*[:\\-–—]?\\s*`, 'i'), '');
+              t = t.replace(new RegExp(`^(?:${PREFIJOS})\\s*[:\\-–—]\\s*`, 'i'), '');
+              t = t.replace(/[.。]\s*$/, '').trim();
+              if (!t) return rawTitle;
+              t = t[0].toUpperCase() + t.slice(1);
+              return t.length > 120 ? `${t.slice(0, 119).trimEnd()}…` : t;
+            };
+            const tituloNuevo = normalizarTitulo(issue.title);
+            const cambiaTitulo = tituloNuevo !== issue.title;
+
+            // ── 4. Body: el texto original queda intacto, todo se agrega al final ──
+            const BEGIN = '<!-- triage:begin -->';
+            const END = '<!-- triage:end -->';
+
+            // Parte el body alrededor del bloque de triaje para poder re-triar
+            // sin duplicarlo y sin moverlo de lugar.
+            function partir(body) {
+              const i = body.indexOf(BEGIN);
+              if (i === -1) return { antes: body, despues: '' };
+              const j = body.indexOf(END, i);
+              if (j === -1) return { antes: body.slice(0, i), despues: '' };
+              return { antes: body.slice(0, i), despues: body.slice(j + END.length) };
+            }
+
+            const SECCIONES = [
+              { h: 'Pasos para reproducir', b: '<!-- completá estos pasos -->\n\n1. \n2. \n3. ' },
+              { h: 'Resultado esperado', b: '<!-- qué debería pasar en su lugar -->' },
+              { h: 'Entorno', b: '- Navegador: \n- Sistema operativo: \n- ¿Afecta al móvil?: ' },
+            ];
+            function tieneSeccion(body, h) {
+              const objetivo = plain(h);
+              return body.split('\n').some((linea) => {
+                const t = plain(linea.trim().replace(/^#+\s*/, '')).replace(/[:?]/g, '').trim();
+                return t === objetivo || t.startsWith(`${objetivo} `);
+              });
+            }
+
+            const { antes, despues } = partir(issue.body ?? '');
+            const antesLimpio = antes.replace(/\s+$/, '');
+            // Para saber si falta una sección hay que mirar el body entero: en un
+            // re-triaje las secciones quedan después del bloque, no antes.
+            const cuerpoPrevio = `${antesLimpio}${despues}`;
+
+            const labels = ok
+              ? [tipo, AREA_BY_KEY.get(area).label,
+                 `prio:${prio}`, `tam:${tam}`,
+                 ...(faltaRepro ? ['necesita-repro'] : []),
+                 ...(primerIssue ? ['good first issue'] : [])]
+              : ['needs-triage'];
+
+            const fecha = new Date().toISOString().slice(0, 10);
+            const bloque = [
+              BEGIN,
+              '<details>',
+              '<summary>🤖 Triaje automático</summary>',
+              '',
+              ...(ok
+                ? [
+                    '| | |',
+                    '|---|---|',
+                    `| Tipo | \`${tipo}\` |`,
+                    `| Área | ${AREA_SHOW[area]} |`,
+                    `| Módulo | \`${modulo}\` |`,
+                    `| Prioridad | ${prio} |`,
+                    `| Tamaño | ${tam} |`,
+                    `| Autor | @${issue.user.login} |`,
+                    '',
+                    `_Clasificado automáticamente el ${fecha}. Si algo no va, corregilo con \`/oc\`._`,
+                  ]
+                : [
+                    'No se pudo clasificar automáticamente. Revisá y corregí a mano.',
+                    '',
+                    '| | |',
+                    '|---|---|',
+                    `| Autor | @${issue.user.login} |`,
+                  ]),
+              '',
+              '</details>',
+              END,
+            ].join('\n');
+
+            const nuevas = SECCIONES.filter((s) => !tieneSeccion(cuerpoPrevio, s.h));
+            // Solo se recorta el whitespace del final del documento (o sea, de
+            // lo que agrega este flujo), nunca del texto del reportero. Así
+            // dos corridas seguidas producen exactamente el mismo body.
+            const cuerpoNuevo = `${
+              [
+                ...(antesLimpio ? [antesLimpio, ''] : []),
+                bloque,
+                ...nuevas.flatMap((s) => ['', `## ${s.h}`, '', s.b]),
+                ...(despues.replace(/^\n+/, '').trim() ? ['', despues.replace(/^\n+/, '').trim()] : []),
+              ].join('\n').replace(/\s*$/, '')
+            }\n`;
+
+            const cambiaBody = cuerpoNuevo !== (issue.body ?? '');
+            if (cambiaTitulo || cambiaBody) {
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: n,
+                ...(cambiaTitulo ? { title: tituloNuevo } : {}),
+                ...(cambiaBody ? { body: cuerpoNuevo } : {}),
+              });
+              core.info(`Issue #${n}: título ${cambiaTitulo ? 'normalizado' : 'sin cambios'}, body ${cambiaBody ? 'actualizado' : 'sin cambios'}.`);
+            } else {
+              core.info(`Issue #${n} ya estaba al día.`);
+            }
+
+            // ── 5. Labels ─────────────────────────────────────────────────────
+            const { data: puestos } = await github.rest.issues.listLabelsOnIssue({
+              ...context.repo, issue_number: n, per_page: 100,
+            });
+            const actuales = new Set(puestos.map((l) => l.name));
+
+            const { data: delRepo } = await github.rest.issues.listLabelsForRepo({
+              ...context.repo, per_page: 100,
+            });
+            const delRepoNombres = new Set(delRepo.map((l) => l.name));
+
+            for (const m of MANAGED) {
+              if (delRepoNombres.has(m.name)) continue;
+              try {
+                await github.rest.issues.createLabel({ ...context.repo, ...m });
+                core.info(`Label creada: ${m.name}`);
+              } catch (e) {
+                if (e.status !== 422) core.warning(`No se pudo crear "${m.name}": ${e.message}`);
+              }
+            }
+
+            for (const l of labels) {
+              if (actuales.has(l)) continue;
+              try {
+                await github.rest.issues.addLabels({ ...context.repo, issue_number: n, labels: [l] });
+              } catch (e) {
+                core.warning(`No se pudo agregar "${l}": ${e.message}`);
+              }
+            }
+            for (const l of actuales) {
+              if (!MANAGED_NAMES.has(l) || labels.includes(l)) continue;
+              try {
+                await github.rest.issues.removeLabel({ ...context.repo, issue_number: n, name: l });
+              } catch (e) {
+                core.warning(`No se pudo quitar "${l}": ${e.message}`);
+              }
+            }
+            core.info(`Labels: [${labels.join(', ')}]`);
+
+            // ── 6. Auto-asignación ────────────────────────────────────────────
+            let owners = {};
+            try { owners = JSON.parse(process.env.AREA_OWNERS || '{}'); } catch { owners = {}; }
+            const candidatos = [owners[area], process.env.DEFAULT_OWNER]
+              .filter(Boolean)
+              .map((s) => String(s).trim().replace(/^@/, ''))
+              .filter((l) => l && l !== issue.user.login);
+            const logins = [...new Set(candidatos)];
+            const asignado = (issue.assignees ?? []).some((a) => logins.includes(a.login));
+            if (logins.length && !asignado) {
+              try {
+                await github.rest.issues.addAssignees({ ...context.repo, issue_number: n, assignees: logins });
+                core.info(`Asignado a ${logins.join(', ')}`);
+              } catch (e) {
+                core.warning(`No se pudo asignar: ${e.message}`);
+              }
+            }
+
+            // ── 7. PRs abiertos relacionados ──────────────────────────────────
+            const kws = keywords(`${issue.title} ${antesLimpio}`);
+            const raiz = area.replace(/s$/, '');
+            const { data: prs } = await github.rest.pulls.list({ ...context.repo, state: 'open', per_page: 50 });
+            const relacionados = prs
+              .map((pr) => {
+                const palabras = new Set(plain(`${pr.title} ${pr.head.ref}`).split(' '));
+                let score = [...kws].filter((k) => palabras.has(k)).length;
+                if (raiz && plain(pr.head.ref).split(' ').some((w) => w.startsWith(raiz))) score += 2;
+                return { pr, score };
+              })
+              .filter((r) => r.score > 0)
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 3);
+
+            // ── 8. Comentario del bot (se actualiza, no se duplica) ───────────
+            const MARCA = '<!-- triage-comment -->';
+            const lineas = [MARCA, '', '🤖 **Triaje automático**', ''];
+
+            if (ok) {
+              lineas.push(`**${tipo}** · ${AREA_SHOW[area]} · prioridad **${prio}** · tamaño **${tam}**`);
+              if (resumen) lineas.push('', `> ${resumen}`);
+            } else {
+              lineas.push(
+                'No pude clasificar este issue automáticamente.',
+                '',
+                'Para reintentar: **Actions → triage de issues → Run workflow**, con este número de issue.',
+              );
+            }
+
+            if (relacionados.length) {
+              lineas.push('', '**PRs abiertos relacionados**', '');
+              for (const { pr, score } of relacionados) {
+                lineas.push(`- #${pr.number} \`${pr.head.ref}\` — ${pr.title} _(${score} en común)_`);
+              }
+            }
+
+            lineas.push('', '**Checklist de revisión**', '');
+            lineas.push(`- [${ok ? 'x' : ' '}] Clasificado por el flujo automático`);
+            lineas.push(`- [${ok && !faltaRepro ? 'x' : ' '}] Tiene pasos para reproducir`);
+            lineas.push('- [ ] Se reproduce en `main`');
+            lineas.push('- [ ] No es duplicado de otro issue');
+            lineas.push(`- [${asignado || logins.length ? 'x' : ' '}] Alguien lo toma${logins.length ? ` — @${logins.join(' @')}` : ''}`);
+
+            const comentario = lineas.join('\n');
+            const { data: comentarios } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: n, per_page: 100,
+            });
+            const previo = comentarios.find((cm) => cm.body?.includes(MARCA) && cm.user.type === 'Bot');
+            if (previo) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: previo.id, body: comentario });
+              core.info('Comentario actualizado.');
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: n, body: comentario });
+              core.info('Comentario creado.');
+            }
+
+            if (!ok) {
+              core.warning('Clasificación fallida: el issue quedó con needs-triage.');
+            }
